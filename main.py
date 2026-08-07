@@ -1,14 +1,15 @@
 """
 main.py — KinderSort GUI entry point (updated for responsiveness and logging).
 
-Changes:
-- Worker -> GUI communication goes via a queue polled by the main thread.
-- Mode combobox added to let user pick processing profile (auto/fast/balanced/accurate).
-- Background thread posts progress/errors/done messages to the queue instead of
-  scheduling many small after() calls from the worker.
-- Reduced ticker frequency to reduce UI updates on low-end machines.
-- Exceptions from worker get logged and shown via messagebox.
-- Passes selected mode to PhotoSorter for speed/accuracy tuning.
+Improvements:
+- Stronger input validation before starting:
+  - Ensure Reference folder contains at least one supported image file.
+  - Ensure Events folder contains at least one supported image file (recursively).
+  - Prevent selecting the same path for Reference/Events/Output.
+  - Test that Output folder is creatable and writable by attempting a small temp file.
+  - Provide clear messagebox dialogs for each invalid input case.
+- Helper functions added for image detection and writability checks.
+- Other behavior preserved.
 """
 
 import threading
@@ -18,9 +19,13 @@ import logging
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+import tempfile
 
 from sorter import PhotoSorter
 from utils import setup_logger
+
+# supported image extensions
+_SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 class KinderSortApp(tk.Tk):
@@ -220,6 +225,7 @@ class KinderSortApp(tk.Tk):
         events = self._events_var.get().strip()
         output = self._output_var.get().strip()
 
+        # Basic presence check
         if not ref or not events or not output:
             messagebox.showerror(
                 "Missing folders",
@@ -231,16 +237,10 @@ class KinderSortApp(tk.Tk):
         events_path = Path(events)
         output_path = Path(output)
 
-        for path, name in [(ref_path, "Reference"), (events_path, "Events")]:
-            if not path.is_dir():
-                messagebox.showerror("Invalid folder", f"{name} folder does not exist:\n{path}")
-                return
-
-        # Ensure output folder is creatable / writable
-        try:
-            output_path.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            messagebox.showerror("Output folder error", f"Cannot create output folder:\n{exc}")
+        # Validate paths and contents
+        ok, msg = self._validate_inputs(ref_path, events_path, output_path)
+        if not ok:
+            messagebox.showerror("Input validation failed", msg)
             return
 
         # Disable start, enable cancel before launching thread
@@ -327,6 +327,203 @@ class KinderSortApp(tk.Tk):
         self._set_status("Cancelling… (finishing current image)")
         if self.logger:
             self.logger.info("User requested cancellation.")
+
+    # ------------------------------------------------------------------
+    # Worker->GUI queue processing (runs on main thread)
+    # ------------------------------------------------------------------
+
+    def _process_queue(self) -> None:
+        """Poll the message queue and update UI on the main thread."""
+        try:
+            while True:
+                msg = self._msg_queue.get_nowait()
+                typ = msg[0]
+                if typ == "ref_progress":
+                    _, current, total, name = msg
+                    self._set_status(f"Loading references [{current}/{total}]: {name}…")
+                elif typ == "ref_warning":
+                    _, skipped = msg
+                    self._show_ref_warning(skipped)
+                elif typ == "progress":
+                    _, current, total, filename = msg
+                    self._apply_progress(current, total, filename)
+                elif typ == "done":
+                    _, summary = msg
+                    self._on_done(summary)
+                elif typ == "error":
+                    _, message = msg
+                    # Log and show error dialog
+                    if self.logger:
+                        self.logger.error("Worker error: %s", message)
+                    self._on_error(message)
+                else:
+                    if self.logger:
+                        self.logger.debug("Unknown queue message: %s", msg)
+        except queue.Empty:
+            pass
+        finally:
+            # Poll again later
+            self.after(self._QUEUE_POLL_MS, self._process_queue)
+
+    # ------------------------------------------------------------------
+    # Cross-thread callbacks (now driven via the queue)
+    # ------------------------------------------------------------------
+
+    def _on_progress(self, current: int, total: int, filename: str) -> None:
+        """Compatibility stub; progress updates come via queue._process_queue."""
+        self._apply_progress(current, total, filename)
+
+    def _apply_progress(self, current: int, total: int, filename: str) -> None:
+        """Apply progress update on main thread."""
+        pct = (current / total * 100) if total else 0
+        self._progress_var.set(pct)
+        self._set_status(f"[{current}/{total}] {filename}")
+
+    def _on_done(self, summary: dict[str, int]) -> None:
+        """Show summary and re-enable controls after successful completion."""
+        elapsed = int(time.monotonic() - self._sort_start_time) if self._sort_start_time else None
+        self._stop_ticker(final_elapsed=elapsed)
+        self._start_btn.config(state=tk.NORMAL)
+        self._cancel_btn.config(state=tk.DISABLED)
+        self._progress_var.set(100)
+
+        cancelled = self._cancel_flag.is_set()
+        status = "Sorting cancelled." if cancelled else "Sorting complete."
+        self._set_status(status)
+
+        lines = [
+            status,
+            "",
+            f"Total images found : {summary['total']}",
+            f"Matched (sorted)   : {summary['matched']}",
+            f"Unmatched          : {summary['unmatched']}",
+            f"Skipped (errors)   : {summary['skipped']}",
+        ]
+        self._write_summary("\n".join(lines))
+
+        if summary["total"] == 0:
+            messagebox.showwarning(
+                "No images found",
+                "No photos were found in the Events folder.\n\n"
+                "Make sure your Events folder contains photos (or sub-folders with photos).\n"
+                "Supported formats: .jpg  .jpeg  .png  .bmp  .webp",
+            )
+
+    def _on_error(self, message: str) -> None:
+        """Show an error dialog and re-enable controls."""
+        self._stop_ticker()
+        self._start_btn.config(state=tk.NORMAL)
+        self._cancel_btn.config(state=tk.DISABLED)
+        self._set_status("An error occurred.")
+        try:
+            messagebox.showerror("Unexpected error", message)
+        except Exception:
+            if self.logger:
+                self.logger.exception("Failed to show error dialog: %s", message)
+
+    # ------------------------------------------------------------------
+    # Input validation helpers
+    # ------------------------------------------------------------------
+
+    def _validate_inputs(self, ref_path: Path, events_path: Path, output_path: Path) -> tuple[bool, str]:
+        """Validate user-selected folders before starting.
+
+        Returns:
+            (ok, message) where ok is False and message describes the problem.
+        """
+        # existence checks
+        if not ref_path.exists() or not ref_path.is_dir():
+            return False, f"Reference folder does not exist or is not a directory:\n{ref_path}"
+        if not events_path.exists() or not events_path.is_dir():
+            return False, f"Events folder does not exist or is not a directory:\n{events_path}"
+
+        # disallow picking the same folder for multiple roles
+        try:
+            ref_resolved = ref_path.resolve()
+            events_resolved = events_path.resolve()
+            output_resolved = output_path.resolve()
+        except Exception:
+            # fallback to raw paths if resolve() fails
+            ref_resolved = ref_path
+            events_resolved = events_path
+            output_resolved = output_path
+
+        if ref_resolved == events_resolved:
+            return False, "Reference and Events folders must be different folders."
+        if ref_resolved == output_resolved or events_resolved == output_resolved:
+            return False, "Output folder should be different from Reference and Events folders."
+
+        # Reference must contain at least one supported image file
+        if not self._has_images_in_dir(ref_path):
+            return False, (
+                "Reference folder does not contain any supported image files.\n"
+                f"Supported formats: {', '.join(sorted(_SUPPORTED_IMAGE_EXTS))}\n"
+                f"Please add one clear photo per student to the Reference folder."
+            )
+
+        # Events must contain at least one supported image (recursively)
+        if not self._has_images_in_tree(events_path):
+            return False, (
+                "Events folder does not contain any supported image files.\n"
+                "Make sure the Events folder contains images or sub-folders with images."
+            )
+
+        # Ensure output folder can be created/written to
+        try:
+            output_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, f"Cannot create output folder:\n{exc}"
+
+        writable, reason = self._test_output_writable(output_path)
+        if not writable:
+            return False, f"Output folder is not writable: {reason}"
+
+        return True, "OK"
+
+    def _has_images_in_dir(self, path: Path) -> bool:
+        """Return True if the directory contains at least one supported image file (non-recursive)."""
+        try:
+            for p in path.iterdir():
+                if p.is_file() and p.suffix.lower() in _SUPPORTED_IMAGE_EXTS:
+                    return True
+        except Exception:
+            # in case of permission errors etc.
+            return False
+        return False
+
+    def _has_images_in_tree(self, path: Path, max_checks: int = 5000) -> bool:
+        """Return True if any supported image exists under path (recursive).
+        Limits the number of files checked to avoid very long scans on huge trees.
+        """
+        count = 0
+        try:
+            for p in path.rglob("*"):
+                if p.is_file():
+                    count += 1
+                    if p.suffix.lower() in _SUPPORTED_IMAGE_EXTS:
+                        return True
+                if count >= max_checks:
+                    break
+        except Exception:
+            return False
+        return False
+
+    def _test_output_writable(self, path: Path) -> tuple[bool, str]:
+        """Try to create and remove a tiny temp file in output folder to verify writability."""
+        try:
+            # Use a small named temp file inside the output folder
+            fd, tmp_path = tempfile.mkstemp(prefix=".kinder_sort_test_", dir=str(path))
+            try:
+                with open(fd, "wb") as f:
+                    f.write(b"x")
+            finally:
+                try:
+                    Path(tmp_path).unlink()
+                except Exception:
+                    pass
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
 
     # ------------------------------------------------------------------
     # Worker->GUI queue processing (runs on main thread)
