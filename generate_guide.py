@@ -6,16 +6,16 @@ pywinauto, captures screenshots at key states, then writes guidebook.md with
 embedded image references and an optional .docx export.
 
 Requirements:
-    pip install pyautogui pywinauto pillow
+    pip install pyautogui pywinauto pillow python-docx
 
 Usage:
     python generate_guide.py
 """
-
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Dict, Optional
 
 import pyautogui
 import pywinauto
@@ -227,11 +227,107 @@ def run_guide_capture() -> None:
         print(f"\nApp still running (PID {proc.pid}). Close it manually when done.")
 
 
+# --- New: explain sorting result helper -----------------------------------
+
+
+def explain_sorting_result(
+    total_images: int,
+    matched: int,
+    unmatched: int,
+    skipped: int,
+    per_student_counts: Optional[Dict[str, int]] = None,
+    low_confidence: Optional[int] = None,
+) -> str:
+    """
+    Produce a human-friendly explanation of the sorting result.
+
+    Parameters:
+      - total_images: Number of photos scanned.
+      - matched: Photos that were placed into one or more student folders.
+      - unmatched: Photos where no student match was selected.
+      - skipped: Photos that couldn't be opened or processed.
+      - per_student_counts: Optional mapping student name -> number of photos assigned.
+      - low_confidence: Optional count of matches considered low-confidence.
+
+    Returns:
+      A multi-paragraph string explaining what the numbers mean and next steps.
+    """
+    if total_images <= 0:
+        return "No images were processed."
+
+    lines = []
+    pct = lambda n: f"{(n / total_images * 100):.1f}%"
+
+    lines.append(
+        f"Summary: {total_images} images scanned — {matched} matched ({pct(matched)}), "
+        f"{unmatched} unmatched ({pct(unmatched)}), {skipped} skipped due to errors."
+    )
+
+    # Interpretation
+    lines.append(
+        "Interpretation:\n"
+        "- Matched: these photos were placed into one or more student folders because the system "
+        "found faces that matched your reference photos.\n"
+        "- Unmatched: no confident match was found; these photos are in the `_unmatched` folder.\n"
+        "- Skipped: files that could not be opened or processed (corrupt files, unsupported formats)."
+    )
+
+    if low_confidence:
+        lines.append(
+            f"Low-confidence matches: {low_confidence} photos were matched but the system had low"
+            " confidence. These are good candidates for a quick manual review — you may want to remove"
+            " or replace the reference photo if many low-confidence matches involve the same student."
+        )
+
+    # Per-student highlights
+    if per_student_counts:
+        total_assigned = sum(per_student_counts.values())
+        top_items = sorted(per_student_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        lines.append("Per-student sample counts (top results):")
+        for name, count in top_items:
+            lines.append(f"- {name}: {count} photos")
+        if total_assigned != matched:
+            lines.append(
+                f"(Note: a single photo may be assigned to multiple students; total assignments = {total_assigned})"
+            )
+
+    # Actionable next steps
+    lines.append(
+        "Next steps & tips:\n"
+        "1. Review `_unmatched` first — these are photos where no student was recognised. Look for common causes:\n"
+        "   • Very small faces (zoomed-out group shots)\n"
+        "   • Motion blur or very poor lighting\n"
+        "   • Faces covered by hats/sunglasses/masks\n"
+        "2. If many photos are in `_unmatched` for a particular event, ensure event photos are inside subfolders named for the event.\n"
+        "3. For low-confidence matches, open the student's folder and quickly scan those images. If there are false positives, "
+        "consider improving that student's reference photo (clear, front-facing) and re-run.\n"
+        "4. To change sensitivity, adjust the DISTANCE_THRESHOLD in sorter.py — lower values are stricter (fewer false positives), "
+        "higher values are more permissive (more matches but possibly more false positives).\n"
+        "5. If you need detailed per-image information, open `kindersort_log.txt` in the Output folder. It typically contains the image name, "
+        "matched student(s) and (where available) the matching confidence or distance for each image — useful for triage."
+    )
+
+    return "\n\n".join(lines)
+
+
 def write_guidebook_md() -> None:
     """Write the teacher guidebook as guidebook.md with embedded screenshots."""
     print("\nWriting guidebook.md...")
 
-    content = """# KinderSort — Teacher's Guide
+    # Create an example dynamic explanation using plausible numbers.
+    # When producing the final guide from within the sorter, replace these example
+    # values with the real metrics and call explain_sorting_result(...) to get
+    # a real-time summary for teachers.
+    example_explanation = explain_sorting_result(
+        total_images=120,
+        matched=95,
+        unmatched=20,
+        skipped=5,
+        per_student_counts={"Ali": 12, "Siti": 10, "Kumar": 9, "Zara": 8},
+        low_confidence=7,
+    )
+
+    content = f"""# KinderSort — Teacher's Guide
 
 *How to sort your students' event photos automatically*
 
@@ -261,291 +357,3 @@ One clear, front-facing photo of each student.
 ### 2. Events Folder
 A folder containing **subfolders** — one subfolder per event.
 - Example structure:
-  ```
-  Events/
-      Sports_Day/
-          IMG_001.jpg
-          IMG_002.jpg
-      Field_Trip/
-          IMG_003.jpg
-  ```
-- ⚠️ **Important:** Photos must be inside a subfolder (the event name), not directly in the Events folder.
-
-### 3. Output Folder
-An empty folder where KinderSort will save the sorted results.
-You can create a new empty folder anywhere on your computer.
-
----
-
-## Step-by-Step Guide
-
-### Step 1 — Open KinderSort
-
-Double-click the **KinderSort.exe** file to launch the app.
-
-![KinderSort on launch](guidebook_assets/01_launch.png)
-
-You will see three folder selector rows at the top.
-
----
-
-### Step 2 — Select Your Reference Photos Folder
-
-Click the **Browse…** button next to "Reference Photos".
-
-Navigate to your folder of student reference photos and click **Select Folder**.
-
-![Reference folder selected](guidebook_assets/02_reference_selected.png)
-
-The path to your folder will appear in the box.
-
----
-
-### Step 3 — Select Your Events Folder
-
-Click the **Browse…** button next to "Events Folder".
-
-Navigate to your Events folder (the one containing event subfolders) and click **Select Folder**.
-
-![Events folder selected](guidebook_assets/03_events_selected.png)
-
----
-
-### Step 4 — Select Your Output Folder
-
-Click the **Browse…** button next to "Output Folder".
-
-Navigate to your empty output folder and click **Select Folder**.
-
-When all three folders are selected, the app is ready.
-
-![All three folders selected](guidebook_assets/04_all_folders_set.png)
-
----
-
-### Step 5 — Start Sorting
-
-Click the large green **Start Sorting** button.
-
-KinderSort will begin processing your photos. You will see:
-- A **progress bar** filling up as photos are processed
-- A **status line** showing the current photo filename
-
-![Sorting in progress](guidebook_assets/05_sorting_in_progress.png)
-
-> ⏱️ Processing time depends on the number of photos. Expect about 1–2 minutes per 10 photos on a normal computer.
-
-You can click **Cancel** at any time to stop — photos processed so far will be saved.
-
----
-
-### Step 6 — Review the Results
-
-When sorting is complete, you will see a summary:
-
-![Sorting complete](guidebook_assets/06_sorting_complete.png)
-
-The summary shows:
-- **Total images found** — how many photos were scanned
-- **Matched (sorted)** — how many photos were placed into student folders
-- **Unmatched** — photos where no student face was recognised
-- **Skipped (errors)** — photos that could not be opened
-
----
-
-## Understanding Your Output Folder
-
-After sorting, your Output folder will look like this:
-
-```
-Output/
-    Ali/
-        Sports_Day__IMG_001.jpg
-        Concert__IMG_045.jpg
-    Siti/
-        Sports_Day__IMG_001.jpg   ← same group photo, copied here too
-        Field_Trip__IMG_023.jpg
-    _unmatched/
-        blurry_photo.jpg
-        background_only.jpg
-    kindersort_log.txt
-```
-
-**Each student has their own folder** containing all photos where their face was detected.
-
-The **`_unmatched` folder** contains:
-- Photos where no faces were detected (e.g. landscape shots, blurry images)
-- Photos where faces were detected but didn't match any student (e.g. teachers, parents)
-
-The **`kindersort_log.txt` file** is a detailed record of everything KinderSort did.
-You don't need to read it normally, but it's useful if something seems wrong.
-
----
-
-## Common Problems & Solutions
-
-### "No face was detected" warning on startup
-**Cause:** One of your reference photos doesn't show the student's face clearly enough.
-
-**Fix:** Replace that student's reference photo with a clearer, front-facing photo.
-Good lighting and a plain background work best.
-
-### Many photos end up in `_unmatched`
-**Possible causes:**
-1. Reference photo quality is poor — use a clearer photo
-2. Event photos are very blurry or taken from far away
-3. Students are wearing face masks or hats in the event photos
-
-**Fix:** Try better reference photos first. KinderSort cannot recognise faces that
-are partially covered or turned away.
-
-### "Missing folders" error when clicking Start
-**Fix:** Make sure all three folder fields are filled in before clicking Start Sorting.
-
-### The app seems stuck / progress bar not moving
-**Cause:** Face recognition is CPU-intensive — it is still working.
-
-**Fix:** Wait patiently. A batch of 100 photos may take 10–15 minutes on an older computer.
-Watch the status line — if it shows a new filename, it is still running.
-
-### Output folder photos have long names like `Sports_Day__IMG_001.jpg`
-This is normal! The event folder name is added as a prefix so you always know
-which event a photo came from.
-
----
-
-## Tips for Better Results
-
-1. **Use a clear, recent reference photo** — front-facing, good lighting, no sunglasses
-2. **One face per reference photo** — if a reference photo has multiple faces, KinderSort uses the first face detected
-3. **Consistent lighting** helps — very dark or backlit event photos may not match well
-4. **Re-run with a higher tolerance** if you're missing matches — ask your IT support to adjust the `DISTANCE_THRESHOLD` in `sorter.py` from `0.5` to `0.6`
-5. **Keep events in subfolders** — KinderSort only reads photos inside named subfolders of the Events folder
-
----
-
-*KinderSort — Student Photo Organiser | Runs fully offline, no internet required*
-"""
-
-    guidebook_path = Path("guidebook.md")
-    guidebook_path.write_text(content, encoding="utf-8")
-    print(f"guidebook.md written ({len(content)} chars)")
-
-
-def export_to_docx_python() -> None:
-    """Export guidebook.md to KinderSort_Teacher_Guide.docx using python-docx.
-
-    Parses the markdown manually (headings, paragraphs, code blocks, images)
-    and builds a Word document with inline images from guidebook_assets/.
-    """
-    try:
-        from docx import Document
-        from docx.shared import Inches, Pt
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-    except ImportError:
-        print("python-docx not installed. Run: pip install python-docx")
-        return
-
-    print("\nExporting to .docx...")
-    doc = Document()
-
-    # Style the document
-    style = doc.styles["Normal"]
-    style.font.name = "Calibri"
-    style.font.size = Pt(11)
-
-    content = Path("guidebook.md").read_text(encoding="utf-8")
-    lines = content.split("\n")
-
-    in_code_block = False
-    code_lines = []
-
-    for line in lines:
-        # Code block toggle
-        if line.startswith("```"):
-            if in_code_block:
-                # End code block — add as a paragraph with monospace font
-                para = doc.add_paragraph()
-                run = para.add_run("\n".join(code_lines))
-                run.font.name = "Courier New"
-                run.font.size = Pt(9)
-                para.paragraph_format.left_indent = Inches(0.5)
-                code_lines = []
-            in_code_block = not in_code_block
-            continue
-
-        if in_code_block:
-            code_lines.append(line)
-            continue
-
-        # Headings
-        if line.startswith("#### "):
-            doc.add_heading(line[5:], level=4)
-        elif line.startswith("### "):
-            doc.add_heading(line[4:], level=3)
-        elif line.startswith("## "):
-            doc.add_heading(line[3:], level=2)
-        elif line.startswith("# "):
-            doc.add_heading(line[2:], level=1)
-        # Inline image
-        elif line.startswith("!["):
-            # Extract path: ![alt](path)
-            try:
-                path_part = line.split("(")[1].rstrip(")")
-                img_path = Path(path_part)
-                if img_path.exists():
-                    para = doc.add_paragraph()
-                    run = para.add_run()
-                    run.add_picture(str(img_path), width=Inches(5.5))
-                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                else:
-                    doc.add_paragraph(f"[Image not found: {path_part}]")
-            except (IndexError, Exception) as e:  # noqa: BLE001
-                doc.add_paragraph(f"[Image error: {e}]")
-        # Horizontal rule
-        elif line.strip() == "---":
-            doc.add_paragraph("─" * 60)
-        # List items
-        elif line.startswith("- ") or line.startswith("* "):
-            doc.add_paragraph(line[2:], style="List Bullet")
-        elif line.startswith("  - ") or line.startswith("  * "):
-            doc.add_paragraph(line[4:], style="List Bullet 2")
-        # Numbered list
-        elif len(line) > 2 and line[0].isdigit() and line[1] == ".":
-            doc.add_paragraph(line[3:], style="List Number")
-        # Blockquote
-        elif line.startswith("> "):
-            para = doc.add_paragraph(line[2:])
-            para.paragraph_format.left_indent = Inches(0.4)
-        # Empty line
-        elif not line.strip():
-            pass  # Skip blank lines (headings/paragraphs handle spacing)
-        # Normal paragraph
-        else:
-            doc.add_paragraph(line)
-
-    out_path = Path("KinderSort_Teacher_Guide.docx")
-    doc.save(str(out_path))
-    print(f"Exported: {out_path.resolve()}")
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="KinderSort guidebook generator")
-    parser.add_argument(
-        "--mode",
-        choices=["capture", "write-guide", "export-docx", "all"],
-        default="all",
-        help="What to run: capture screenshots, write guide, export docx, or all",
-    )
-    args = parser.parse_args()
-
-    if args.mode in ("capture", "all"):
-        run_guide_capture()
-
-    if args.mode in ("write-guide", "all"):
-        write_guidebook_md()
-
-    if args.mode in ("export-docx", "all"):
-        export_to_docx_python()
