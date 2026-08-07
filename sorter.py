@@ -1,24 +1,19 @@
 """
 sorter.py — Face recognition logic for KinderSort (memory-optimised).
 
-This edit focuses on reducing peak memory usage during sorting while keeping
-accuracy and the previously added performance options. Key changes:
+This edit improves matching accuracy while preserving the low-memory
+matching approach. Additions:
 
-- Avoid building large stacked arrays of known encodings at runtime; instead
-  iterate the stored encodings one-by-one when matching a face to keep memory
-  usage low (trades off a small CPU cost for much lower peak RAM).
-- Use squared-distance comparisons to avoid computing square roots for each
-  candidate (faster and lower memory churn).
-- Aggressively delete large temporary variables after use and call gc.collect()
-  at the end of each image to release memory back to the OS earlier.
-- Ensure encodings remain float32 to minimise memory use.
+- Second-best margin check to reject ambiguous nearest neighbours.
+- Cosine-similarity verification using cached per-student vector norms.
+- Mode-aware threshold tightening for 'accurate' mode.
+- Per-reference norm caching computed at load time.
+- Keeps memory-conscious iteration over stored encodings.
 
-Other behaviour (modes, caching, adaptive detection) is preserved from the
-previous improved version.
+Other behaviour (modes, caching, adaptive detection) is preserved.
 """
 
 import logging
-import warnings
 import gc
 from collections.abc import Callable
 from pathlib import Path
@@ -47,6 +42,11 @@ class PhotoSorter:
     MAX_IMAGE_DIMENSION = 1000
     CACHE_FILENAME = ".kinder_encodings.npz"
 
+    # Ambiguity / verification parameters
+    SECOND_BEST_RATIO = 1.20       # second_best_dist2 must be >= SECOND_BEST_RATIO * best_dist2
+    COSINE_THRESHOLD = 0.35       # minimum cosine similarity to accept (0..1)
+    NEAR_THRESHOLD_FACTOR = 0.85  # when best_dist2 is within this * threshold2, treat as "near"
+
     def __init__(
         self,
         reference_folder: Path,
@@ -61,29 +61,39 @@ class PhotoSorter:
         self.logger = logger
         # Keep encodings in a dict of small float32 arrays — avoids large float64
         self._student_encodings: dict[str, np.ndarray] = {}
+        # Norm cache for cosine verification (float32)
+        self._student_norms: dict[str, float] = {}
 
         self.mode = mode if mode in ("fast", "balanced", "accurate", "auto") else "balanced"
         self._configure_mode()
 
     def _configure_mode(self) -> None:
+        # Defaults
         if self.mode == "fast":
             self._detection_model = "hog"
             self._detection_upsample = 0
             self._encoding_model = "small"
             self._num_jitters_ref = 1
             self._num_jitters_detect = 0
+            self._distance_threshold = self.DISTANCE_THRESHOLD
+            self._cosine_threshold = max(0.0, self.COSINE_THRESHOLD - 0.05)
         elif self.mode == "accurate":
             self._detection_model = "cnn"
             self._detection_upsample = 1
             self._encoding_model = "large"
             self._num_jitters_ref = 10
             self._num_jitters_detect = 3
+            # be slightly stricter in accurate mode
+            self._distance_threshold = max(0.35, self.DISTANCE_THRESHOLD - 0.10)
+            self._cosine_threshold = min(1.0, self.COSINE_THRESHOLD + 0.10)
         else:
             self._detection_model = "hog"
             self._detection_upsample = 0
             self._encoding_model = "large"
             self._num_jitters_ref = 3
             self._num_jitters_detect = 1
+            self._distance_threshold = self.DISTANCE_THRESHOLD
+            self._cosine_threshold = self.COSINE_THRESHOLD
 
         if self.mode == "auto":
             try:
@@ -98,17 +108,21 @@ class PhotoSorter:
                     self._encoding_model = "small"
                     self._num_jitters_ref = 1
                     self._num_jitters_detect = 0
+                    self._distance_threshold = self.DISTANCE_THRESHOLD
+                    self._cosine_threshold = max(0.0, self.COSINE_THRESHOLD - 0.05)
             except Exception:
                 pass
 
         self.logger.debug(
-            "Mode=%s detection_model=%s detection_upsample=%d encoding_model=%s num_jitters_ref=%d num_jitters_detect=%d",
+            "Mode=%s detection_model=%s detection_upsample=%d encoding_model=%s num_jitters_ref=%d num_jitters_detect=%d distance_threshold=%.3f cosine_threshold=%.3f",
             self.mode,
             self._detection_model,
             self._detection_upsample,
             self._encoding_model,
             self._num_jitters_ref,
             self._num_jitters_detect,
+            self._distance_threshold,
+            self._cosine_threshold,
         )
 
     def _cache_path(self) -> Path:
@@ -147,6 +161,17 @@ class PhotoSorter:
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("Could not save reference cache: %s", exc)
 
+    def _rebuild_norms(self) -> None:
+        """Recompute cached vector norms for cosine checks."""
+        self._student_norms.clear()
+        for name, enc in self._student_encodings.items():
+            try:
+                n = float(np.linalg.norm(enc.astype(np.float32)))
+            except Exception:
+                n = float(np.linalg.norm(np.asarray(enc, dtype=np.float32)))
+            # avoid zero norm
+            self._student_norms[name] = n if n > 0.0 else 1e-10
+
     def load_references(
         self,
         progress_callback: Callable[[int, int, str], None] | None = None,
@@ -168,6 +193,8 @@ class PhotoSorter:
                 Path(name).stem: enc.astype(np.float32)
                 for name, enc in zip(cache["names"], cache["encodings"])
             }
+            # rebuild norms for cosine tests
+            self._rebuild_norms()
             self.logger.info("Loaded %d student reference(s) from cache", len(self._student_encodings))
             return no_face_names
 
@@ -229,6 +256,10 @@ class PhotoSorter:
                 self.logger.error("Could not read reference image (unrecognised): %s", ref_path)
             except Exception as exc:  # noqa: BLE001
                 self.logger.error("Could not read reference photo %s: %s", ref_path.name, exc)
+
+        # rebuild norms after loading all references
+        if self._student_encodings:
+            self._rebuild_norms()
 
         if enc_list:
             try:
@@ -392,42 +423,81 @@ class PhotoSorter:
         return arr
 
     def _match_face_memory_efficient(self, encoding: np.ndarray) -> str | None:
-        """Memory-efficient nearest-neighbour search over stored encodings.
+        """Memory-efficient nearest-neighbour search with ambiguity and cosine checks.
 
         Iterates stored encodings one at a time to avoid allocating a large
         distances array. Uses squared-distance comparison to avoid per-candidate
-        square-root calls.
+        square-root calls. Performs a second-best margin test and a cosine
+        similarity verification to reduce false positives.
+
+        Returns the best matching student name or None.
         """
         if not self._student_encodings:
             return None
 
         target = encoding.astype(np.float32)
         best_name: str | None = None
+        best_known_enc: np.ndarray | None = None
         best_dist2 = float("inf")
-        threshold2 = float(self.DISTANCE_THRESHOLD * self.DISTANCE_THRESHOLD)
+        second_best_dist2 = float("inf")
+
+        threshold2 = float(self._distance_threshold * self._distance_threshold)
 
         # Iterate over known encodings without creating big temporary arrays
         for name, known_enc in self._student_encodings.items():
-            # both are float32 small arrays: compute squared L2 distance
-            # use dot product which is efficient and avoids creating a full diff array
             try:
                 diff = known_enc - target
                 dist2 = float(np.dot(diff, diff))
             except Exception:
-                # fallback to safe numpy norm
                 dist2 = float(np.sum((known_enc - target) ** 2))
 
+            # update best and second-best distances
             if dist2 < best_dist2:
+                second_best_dist2 = best_dist2
                 best_dist2 = dist2
                 best_name = name
+                best_known_enc = known_enc
+            elif dist2 < second_best_dist2:
+                second_best_dist2 = dist2
 
             # early exit if perfect match (very rare)
             if best_dist2 == 0.0:
                 break
 
-        if best_dist2 <= threshold2:
-            self.logger.debug("Face matched to %s (dist2=%.6f)", best_name, best_dist2)
-            return best_name
+        # If no candidate within threshold, immediately return
+        if best_dist2 > threshold2:
+            self.logger.debug("No match — best dist2=%.6f (threshold2=%.6f)", best_dist2, threshold2)
+            return None
 
-        self.logger.debug("No match — best dist2=%.6f", best_dist2)
-        return None
+        # Ambiguity check: ensure the second-best is sufficiently worse than best
+        if second_best_dist2 < float("inf"):
+            if second_best_dist2 < self.SECOND_BEST_RATIO * best_dist2:
+                self.logger.debug(
+                    "Ambiguous match rejected for %s (best=%.6f second=%.6f)", best_name, best_dist2, second_best_dist2
+                )
+                return None
+
+        # Cosine-similarity verification on the best candidate
+        try:
+            if best_name is None or best_known_enc is None:
+                return None
+            known_norm = self._student_norms.get(best_name)
+            if known_norm is None:
+                known_norm = float(np.linalg.norm(best_known_enc.astype(np.float32))) or 1e-10
+                self._student_norms[best_name] = known_norm
+
+            target_norm = float(np.linalg.norm(target)) or 1e-10
+            cos_sim = float(np.dot(best_known_enc.astype(np.float32), target) / (known_norm * target_norm + 1e-12))
+
+            if cos_sim < self._cosine_threshold:
+                # If it's near distance threshold we allow the refinement path in sort_all to try harder.
+                self.logger.debug(
+                    "Cosine check failed for %s (cos=%.4f dist2=%.6f) — rejecting", best_name, cos_sim, best_dist2
+                )
+                return None
+        except Exception:
+            # If cosine check fails unexpectedly, fall back to L2 acceptance (safe default)
+            self.logger.debug("Cosine verification failed unexpectedly — accepting L2 match for %s", best_name)
+
+        self.logger.debug("Face matched to %s (dist2=%.6f)", best_name, best_dist2)
+        return best_name
