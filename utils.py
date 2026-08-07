@@ -2,15 +2,13 @@
 utils.py — File helpers, naming, and logging for KinderSort.
 
 Improvements in this edit (preprocessing and data handling):
-- Robust image-file detection: checks extension and falls back to imghdr content sniffing.
-- Duplicate image detection when collecting event images (MD5 hash + size) to avoid processing identical files multiple times.
-- Hidden files/folders are ignored.
-- Sanitise event names and output filenames to be filesystem-safe and length-limited.
-- safe_copy uses an atomic replace (write to temporary file then os.replace) and retries to avoid race conditions.
-- Added utility helpers: compute_file_hash, ensure_folder.
-
-The APIs used by sorter.py are preserved (setup_logger, is_image_file, collect_event_images,
-build_output_filename, safe_copy).
+- EXIF-aware image loading and auto-rotation.
+- Convert images to RGB numpy arrays sized to a maximum dimension to reduce memory/CPU.
+- Pillow-based fallback for image detection when imghdr misses.
+- Improved dedup logic and clearer error handling.
+- Utility helpers: load_image_for_recognition, open_image_safely.
+- APIs used by sorter.py preserved (setup_logger, is_image_file, collect_event_images,
+  build_output_filename, safe_copy).
 """
 
 import hashlib
@@ -21,12 +19,20 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+from PIL import ExifTags, Image, UnidentifiedImageError
+import numpy as np
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # Limits for sanitised names
 _MAX_FILENAME_LENGTH = 200
 _MAX_EVENT_NAME_LENGTH = 80
+
+# Maximum image dimension (largest side) to resize to before face recognition.
+# Keeps memory use and CPU lower on low-spec machines while preserving recognisable faces.
+MAX_IMAGE_DIMENSION = 1600
 
 
 def setup_logger(output_folder: Path) -> logging.Logger:
@@ -68,8 +74,7 @@ def is_image_file(path: Path) -> bool:
 
     Fast check: extension-based (case-insensitive). If the extension is
     unrecognised, attempt a lightweight content sniff using imghdr.what().
-    This improves robustness for misnamed files while keeping a cheap
-    fallback for the common case.
+    If that fails, perform a lightweight Pillow open/verify as a last resort.
     """
     if not path or not path.exists() or not path.is_file():
         return False
@@ -78,18 +83,22 @@ def is_image_file(path: Path) -> bool:
     if suffix in SUPPORTED_EXTENSIONS:
         return True
 
-    # Fallback: sniff file header. imghdr.what returns None if the file is
-    # not a known image type; this is tolerant and cheap for mislabelled files.
+    # Fallback: sniff file header. imghdr.what accepts a filename string.
     try:
-        kind = imghdr.what(path)
-        # imghdr names like 'jpeg', 'png', 'bmp' — map to extensions set
+        kind = imghdr.what(str(path))
         if kind is not None:
             kind_ext = f".{kind.lower()}"
             return kind_ext in SUPPORTED_EXTENSIONS
     except Exception:
         pass
 
-    return False
+    # Final fallback: try Pillow verify (cheap header check). Use try/except to avoid raising.
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
 
 
 def compute_file_hash(path: Path, chunk_size: int = 32768) -> str:
@@ -160,26 +169,27 @@ def ensure_folder(path: Path, exist_ok: bool = True, perms: int | None = None) -
             pass
 
 
-def collect_event_images(events_folder: Path) -> list[tuple[Path, str]]:
+def collect_event_images(events_folder: Path) -> List[Tuple[Path, str]]:
     """Walk immediate subfolders of events_folder and collect image paths.
 
     Returns a list of (image_path, event_name) tuples where event_name is the
     name of the immediate subfolder containing the image.
 
-    Behaviour improvements over the previous version:
+    Behaviour improvements:
     - Ignores hidden files and folders (names starting with '.')
     - De-duplicates identical files (same size + MD5 hash) so duplicates across
       different subfolders are not processed multiple times.
     - Falls back to scanning the root of events_folder if no images are found in
       subfolders (flat structure).
     """
-    results: list[tuple[Path, str]] = []
-    seen_hashes: set[str] = set()
+    results: List[Tuple[Path, str]] = []
+    seen_hashes: Set[str] = set()
+    # Map size -> set of observed hashes (optimises collisions-on-size checks)
+    size_to_hashes: Dict[int, Set[str]] = {}
 
     if not events_folder.exists() or not events_folder.is_dir():
         return results
 
-    # Helper to process a directory and append files
     def _process_dir(dir_path: Path, event_name: str) -> None:
         for image_path in sorted(dir_path.iterdir()):
             if image_path.name.startswith("."):
@@ -189,16 +199,16 @@ def collect_event_images(events_folder: Path) -> list[tuple[Path, str]]:
             if not is_image_file(image_path):
                 continue
             try:
-                # quick dedupe using size + md5
                 size = image_path.stat().st_size
-                # combine size into pseudo-key to avoid hashing every file
-                size_key = f"{size}:{image_path.name}"
-                # compute full hash only if necessary
+                # compute hash; small cost but necessary for robust de-duplication
                 digest = compute_file_hash(image_path)
                 unique_key = f"{size}:{digest}"
                 if unique_key in seen_hashes:
+                    # duplicate file encountered; skip
                     continue
                 seen_hashes.add(unique_key)
+                # record per-size mapping (helps future lookups if needed)
+                size_to_hashes.setdefault(size, set()).add(digest)
                 results.append((image_path, event_name))
             except Exception:
                 # If hashing fails, still attempt to include the file (best-effort)
@@ -211,7 +221,6 @@ def collect_event_images(events_folder: Path) -> list[tuple[Path, str]]:
         if item.name.startswith("."):
             continue
         event_name = _sanitize_fragment(item.name, _MAX_EVENT_NAME_LENGTH) or item.name
-        # iterate immediate children (non-recursive) to preserve event grouping
         _process_dir(item, event_name)
 
     # Fallback: if no images found in subfolders, scan root of events_folder directly.
@@ -260,10 +269,10 @@ def safe_copy(src: Path, dest_folder: Path, filename: str, logger: logging.Logge
             os.replace(tmp_path, dest_path)
             logger.debug("Copied %s → %s", src.name, dest_path)
             return dest_path
-        except Exception as exc:
+        except Exception:
             # cleanup temp file if present
             try:
-                if 'tmp_path' in locals() and tmp_path.exists():
+                if "tmp_path" in locals() and tmp_path.exists():
                     tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
@@ -278,4 +287,94 @@ def safe_copy(src: Path, dest_folder: Path, filename: str, logger: logging.Logge
             except Exception:
                 logger.exception("Failed to copy %s to %s", src, dest_path)
                 raise
+
+
+# --- Image preprocessing helpers for face recognition ---------------------------------
+
+
+def open_image_safely(path: Path, logger: Optional[logging.Logger] = None) -> Optional[Image.Image]:
+    """Open an image with Pillow and handle common issues.
+
+    Returns a PIL Image (not yet converted) or None if the file cannot be opened.
+    """
+    try:
+        img = Image.open(path)
+        # Do not load full image yet; verification ensures header is ok.
+        img.verify()
+        # Re-open to get a usable Image object (Pillow quirk after verify())
+        img = Image.open(path)
+        return img
+    except UnidentifiedImageError:
+        if logger:
+            logger.debug("UnidentifiedImageError opening image: %s", path)
+        return None
+    except Exception:
+        if logger:
+            logger.exception("Error opening image: %s", path)
+        return None
+
+
+def _apply_exif_orientation(img: Image.Image) -> Image.Image:
+    """Apply EXIF orientation to a PIL Image if present.
+
+    Leaves the image unchanged if no EXIF orientation tag is present.
+    """
+    try:
+        exif = img._getexif()
+        if not exif:
+            return img
+        # Find the orientation tag code
+        orientation_key = None
+        for tag, name in ExifTags.TAGS.items():
+            if name == "Orientation":
+                orientation_key = tag
+                break
+        if not orientation_key:
+            return img
+        orientation = exif.get(orientation_key)
+        if orientation == 3:
+            img = img.rotate(180, expand=True)
+        elif orientation == 6:
+            img = img.rotate(270, expand=True)
+        elif orientation == 8:
+            img = img.rotate(90, expand=True)
+    except Exception:
+        # Best-effort: silently continue if EXIF processing fails.
+        pass
+    return img
+
+
+def load_image_for_recognition(path: Path, max_dimension: int = MAX_IMAGE_DIMENSION,
+                                logger: Optional[logging.Logger] = None) -> Optional[np.ndarray]:
+    """Load an image from disk, apply EXIF rotation, convert to RGB and optionally resize.
+
+    Returns an RGB numpy array suitable for face_recognition (H, W, 3) or None on error.
+
+    This function is memory-friendly: it resizes oversized images before converting
+    to arrays to reduce memory pressure on low-spec machines.
+    """
+    img = open_image_safely(path, logger=logger)
+    if img is None:
+        return None
+
+    try:
+        img = _apply_exif_orientation(img)
+        # Convert to RGB (face_recognition expects RGB)
+        img = img.convert("RGB")
+
+        # Resize if larger than max_dimension
+        w, h = img.size
+        largest = max(w, h)
+        if max_dimension and largest > max_dimension:
+            scale = max_dimension / float(largest)
+            new_w = int(round(w * scale))
+            new_h = int(round(h * scale))
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        arr = np.asarray(img)
+        return arr
+    except Exception:
+        if logger:
+            logger.exception("Failed to preprocess image for recognition: %s", path)
+        return None
 
