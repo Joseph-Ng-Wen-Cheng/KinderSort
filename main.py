@@ -8,6 +8,7 @@ Changes:
   scheduling many small after() calls from the worker.
 - Reduced ticker frequency to reduce UI updates on low-end machines.
 - Exceptions from worker get logged and shown via messagebox.
+- Passes selected mode to PhotoSorter for speed/accuracy tuning.
 """
 
 import threading
@@ -251,9 +252,13 @@ class KinderSortApp(tk.Tk):
         self._set_status("Loading reference photos…")
         self._start_ticker()
 
+        # Prepare logger and sorter
         logger = setup_logger(output_path)
-        sorter = PhotoSorter(ref_path, events_path, output_path, logger)
+        self.logger = logger
+        mode = self._mode_var.get()
+        sorter = PhotoSorter(ref_path, events_path, output_path, logger, mode=mode)
 
+        # Start background worker thread; it posts messages to self._msg_queue
         thread = threading.Thread(
             target=self._run_sorting, args=(sorter,), daemon=True
         )
@@ -263,27 +268,28 @@ class KinderSortApp(tk.Tk):
         """Worker thread: load references, then sort all photos."""
         try:
             skipped_names = sorter.load_references(
-                progress_callback=self._on_ref_progress
+                progress_callback=lambda c, t, n: self._msg_queue.put(("ref_progress", c, t, n))
             )
-        except Exception as exc:  # noqa: BLE001
-            self.after(0, self._on_error, str(exc))
+        except Exception as exc:
+            # Post full traceback string for the GUI to display
+            self._msg_queue.put(("error", f"Reference load failed: {exc}"))
             return
 
         if skipped_names:
-            self.after(0, self._show_ref_warning, skipped_names)
+            self._msg_queue.put(("ref_warning", skipped_names))
 
         if not sorter._student_encodings:
-            self.after(0, self._on_error, "No student faces could be loaded. Please check your Reference folder.")
+            self._msg_queue.put(("error", "No student faces could be loaded. Please check your Reference folder."))
             return
 
         try:
             summary = sorter.sort_all(
-                progress_callback=self._on_progress,
-                cancelled=self._cancel_flag.is_set,
+                progress_callback=lambda c, t, fn: self._msg_queue.put(("progress", c, t, fn)),
+                cancelled=lambda: self._cancel_flag.is_set(),
             )
-            self.after(0, self._on_done, summary)
-        except Exception as exc:  # noqa: BLE001
-            self.after(0, self._on_error, str(exc))
+            self._msg_queue.put(("done", summary))
+        except Exception as exc:
+            self._msg_queue.put(("error", f"Unexpected error during sorting: {exc}"))
 
     def _start_ticker(self) -> None:
         """Start the spinning clock emoji and elapsed timer."""
@@ -292,7 +298,7 @@ class KinderSortApp(tk.Tk):
         self._tick()
 
     def _tick(self) -> None:
-        """Update spinner and elapsed time every 250 ms."""
+        """Update spinner and elapsed time every _TICK_INTERVAL_MS ms."""
         if self._sort_start_time is None:
             return
         elapsed = int(time.monotonic() - self._sort_start_time)
@@ -300,7 +306,7 @@ class KinderSortApp(tk.Tk):
         spinner = self._spinner_frames[self._spinner_idx % len(self._spinner_frames)]
         self._spinner_idx += 1
         self._timer_label.config(text=f"{spinner}  {minutes:02d}:{seconds:02d} elapsed")
-        self._ticker_id = self.after(250, self._tick)
+        self._ticker_id = self.after(self._TICK_INTERVAL_MS, self._tick)
 
     def _stop_ticker(self, final_elapsed: int | None = None) -> None:
         """Stop the spinner and show final elapsed time."""
@@ -314,32 +320,58 @@ class KinderSortApp(tk.Tk):
             self._timer_label.config(text="")
         self._sort_start_time = None
 
-    def _on_ref_progress(self, current: int, total: int, name: str) -> None:
-        """Called from worker thread after each reference photo is encoded."""
-        self.after(0, self._set_status, f"Loading references [{current}/{total}]: {name}…")
-
-    def _show_ref_warning(self, skipped_names: list[str]) -> None:
-        """Show warning dialog for reference photos with no detectable face."""
-        names_str = "\n".join(f"  • {n}" for n in skipped_names)
-        messagebox.showwarning(
-            "Reference photos without faces",
-            f"No face was detected in the reference photos for:\n\n{names_str}\n\n"
-            "These students will be skipped during sorting.",
-        )
-
     def _on_cancel(self) -> None:
         """Signal the worker thread to stop after the current image."""
         self._cancel_flag.set()
         self._cancel_btn.config(state=tk.DISABLED)
         self._set_status("Cancelling… (finishing current image)")
+        if self.logger:
+            self.logger.info("User requested cancellation.")
 
     # ------------------------------------------------------------------
-    # Cross-thread callbacks (all scheduled via after() from worker)
+    # Worker->GUI queue processing (runs on main thread)
+    # ------------------------------------------------------------------
+
+    def _process_queue(self) -> None:
+        """Poll the message queue and update UI on the main thread."""
+        try:
+            while True:
+                msg = self._msg_queue.get_nowait()
+                typ = msg[0]
+                if typ == "ref_progress":
+                    _, current, total, name = msg
+                    self._set_status(f"Loading references [{current}/{total}]: {name}…")
+                elif typ == "ref_warning":
+                    _, skipped = msg
+                    self._show_ref_warning(skipped)
+                elif typ == "progress":
+                    _, current, total, filename = msg
+                    self._apply_progress(current, total, filename)
+                elif typ == "done":
+                    _, summary = msg
+                    self._on_done(summary)
+                elif typ == "error":
+                    _, message = msg
+                    # Log and show error dialog
+                    if self.logger:
+                        self.logger.error("Worker error: %s", message)
+                    self._on_error(message)
+                else:
+                    if self.logger:
+                        self.logger.debug("Unknown queue message: %s", msg)
+        except queue.Empty:
+            pass
+        finally:
+            # Poll again later
+            self.after(self._QUEUE_POLL_MS, self._process_queue)
+
+    # ------------------------------------------------------------------
+    # Cross-thread callbacks (now driven via the queue)
     # ------------------------------------------------------------------
 
     def _on_progress(self, current: int, total: int, filename: str) -> None:
-        """Update progress bar and status label — called from worker thread via after()."""
-        self.after(0, self._apply_progress, current, total, filename)
+        """Compatibility stub; progress updates come via queue._process_queue."""
+        self._apply_progress(current, total, filename)
 
     def _apply_progress(self, current: int, total: int, filename: str) -> None:
         """Apply progress update on main thread."""
@@ -383,7 +415,11 @@ class KinderSortApp(tk.Tk):
         self._start_btn.config(state=tk.NORMAL)
         self._cancel_btn.config(state=tk.DISABLED)
         self._set_status("An error occurred.")
-        messagebox.showerror("Unexpected error", message)
+        try:
+            messagebox.showerror("Unexpected error", message)
+        except Exception:
+            if self.logger:
+                self.logger.exception("Failed to show error dialog: %s", message)
 
     # ------------------------------------------------------------------
     # Widget helpers
@@ -417,6 +453,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-```
-We need to update main.py to improve AI accuracy. Use create_or_update_file with sha param equal to BlobSha 16e0da1d2039bdb5a251180d33131d645cb9fe9b. Let's proceed to update. (This is analysis). Now perform create_or_update_file.
