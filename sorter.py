@@ -1,17 +1,14 @@
 """
-sorter.py — Face recognition logic for KinderSort (memory-optimised).
+sorter.py — Face recognition logic for KinderSort (memory-optimised) with reference augmentation
+and offline-light mode support.
 
-Enhancements in this version:
-- Normalised mode handling with a safe fallback and explicit logging on unknown modes.
-- Ambiguity handling improved: ambiguous/near-threshold images are copied to an
-  "_uncertain" folder for manual review. They are still counted as unmatched for
-  compatibility, but counts include an extra "uncertain" key.
-- Confidence scoring logged for accepted matches.
-- Ambiguity test combines relative second-best margin and absolute proximity
-  heuristics to reduce false positives while surfacing borderline cases.
-- Refinement path is used more conservatively and only when the face encoding is near threshold.
-- Defensive logging and robust error handling.
-- Keeps the memory-efficient single-pass matching approach.
+Changes in this branch:
+- Support for "offline-light" mode with aggressive low-resource defaults.
+- Reference augmentation (flip + small brightness jitter) to improve robustness; augmented
+  encodings are included in the compressed cache with synthetic names "<orig>::aug:<i>"
+  and are validated against the original file's mtime when loading cache.
+- Uses utils.load_image_for_recognition (which supports lightweight enhancement) for
+  consistent preprocessing and to allow toggling enhancement in low-resource mode.
 """
 import logging
 import gc
@@ -21,7 +18,7 @@ from pathlib import Path
 import typing
 
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageEnhance, UnidentifiedImageError
 
 import face_recognition
 
@@ -30,11 +27,12 @@ from utils import (
     collect_event_images,
     is_image_file,
     safe_copy,
+    load_image_for_recognition,
 )
 
 
 class PhotoSorter:
-    """Encapsulates the sort pipeline with memory-conscious matching."""
+    """Encapsulates the sort pipeline with memory-conscious matching and augmentation."""
 
     DISTANCE_THRESHOLD = 0.50
     MAX_IMAGE_DIMENSION = 1000
@@ -45,6 +43,10 @@ class PhotoSorter:
     COSINE_THRESHOLD = 0.35       # minimum cosine similarity to accept (0..1)
     NEAR_THRESHOLD_FACTOR = 0.85  # when best_dist2 is within this * threshold2, treat as "near"
     ABS_MARGIN = 0.02             # absolute squared-distance margin suggesting ambiguity
+
+    # Reference augmentation parameters
+    AUGMENT_REF = True
+    AUGMENTATIONS = ("flip", "bright_minus", "bright_plus")  # limited set
 
     def __init__(
         self,
@@ -64,11 +66,14 @@ class PhotoSorter:
         self._student_norms: dict[str, float] = {}
 
         mode_norm = (mode or "").strip().lower()
-        if mode_norm not in ("fast", "balanced", "accurate", "auto"):
+        if mode_norm not in ("fast", "balanced", "accurate", "auto", "offline-light"):
             if self.logger:
                 self.logger.warning("Unknown mode '%s' — falling back to 'balanced'", mode)
             mode_norm = "balanced"
         self.mode = mode_norm
+        # per-instance max dimension (may be overridden by mode)
+        self.MAX_IMAGE_DIMENSION = PhotoSorter.MAX_IMAGE_DIMENSION
+        self._apply_enhancement: bool = False
         self._configure_mode()
 
     def _configure_mode(self) -> None:
@@ -81,6 +86,8 @@ class PhotoSorter:
             self._num_jitters_detect = 0
             self._distance_threshold = self.DISTANCE_THRESHOLD
             self._cosine_threshold = max(0.0, self.COSINE_THRESHOLD - 0.05)
+            self.MAX_IMAGE_DIMENSION = 1000
+            self._apply_enhancement = False
         elif self.mode == "accurate":
             self._detection_model = "cnn"
             self._detection_upsample = 1
@@ -90,6 +97,19 @@ class PhotoSorter:
             # be slightly stricter in accurate mode
             self._distance_threshold = max(0.35, self.DISTANCE_THRESHOLD - 0.10)
             self._cosine_threshold = min(1.0, self.COSINE_THRESHOLD + 0.10)
+            self.MAX_IMAGE_DIMENSION = 1600
+            self._apply_enhancement = True
+        elif self.mode == "offline-light":
+            # Aggressive low-resource defaults
+            self._detection_model = "hog"
+            self._detection_upsample = 0
+            self._encoding_model = "small"
+            self._num_jitters_ref = 1
+            self._num_jitters_detect = 0
+            self._distance_threshold = max(0.45, self.DISTANCE_THRESHOLD)  # slightly stricter to avoid FP
+            self._cosine_threshold = max(0.0, self.COSINE_THRESHOLD - 0.10)
+            self.MAX_IMAGE_DIMENSION = 800
+            self._apply_enhancement = True  # small enhancement helps detect faces on poor photos
         else:
             # balanced and default
             self._detection_model = "hog"
@@ -99,6 +119,8 @@ class PhotoSorter:
             self._num_jitters_detect = 1
             self._distance_threshold = self.DISTANCE_THRESHOLD
             self._cosine_threshold = self.COSINE_THRESHOLD
+            self.MAX_IMAGE_DIMENSION = 1000
+            self._apply_enhancement = True
 
         if self.mode == "auto":
             try:
@@ -116,13 +138,15 @@ class PhotoSorter:
                     self._num_jitters_detect = 0
                     self._distance_threshold = self.DISTANCE_THRESHOLD
                     self._cosine_threshold = max(0.0, self.COSINE_THRESHOLD - 0.05)
+                    self.MAX_IMAGE_DIMENSION = 800
+                    self._apply_enhancement = True
             except Exception:
                 # If psutil isn't available, stick with the configured mode
                 pass
 
         if self.logger:
             self.logger.debug(
-                "Mode=%s detection_model=%s detection_upsample=%d encoding_model=%s num_jitters_ref=%d num_jitters_detect=%d distance_threshold=%.3f cosine_threshold=%.3f",
+                "Mode=%s detection_model=%s detection_upsample=%d encoding_model=%s num_jitters_ref=%d num_jitters_detect=%d distance_threshold=%.3f cosine_threshold=%.3f max_dim=%d apply_enh=%s",
                 self.mode,
                 self._detection_model,
                 self._detection_upsample,
@@ -131,6 +155,8 @@ class PhotoSorter:
                 self._num_jitters_detect,
                 self._distance_threshold,
                 self._cosine_threshold,
+                self.MAX_IMAGE_DIMENSION,
+                self._apply_enhancement,
             )
 
     def _cache_path(self) -> Path:
@@ -146,8 +172,13 @@ class PhotoSorter:
             mtimes = list(npz["mtimes"].astype(np.int64))
             encodings = npz["encodings"].astype(np.float32)
 
+            # Validate that originals still match their mtimes. Augmented entries are stored
+            # as "origfilename::aug:N" and validate against the original file's mtime.
             for name, mtime in zip(names, mtimes):
-                ref_path = self.reference_folder / f"{name}"
+                check_name = name
+                if "::aug:" in name:
+                    check_name = name.split("::aug:", 1)[0]
+                ref_path = self.reference_folder / f"{check_name}"
                 if not ref_path.exists() or int(ref_path.stat().st_mtime_ns) != int(mtime):
                     if self.logger:
                         self.logger.debug("Reference cache invalid because %s changed", ref_path)
@@ -203,7 +234,8 @@ class PhotoSorter:
         if cache:
             # Rebuild dict from cache without stacking anything in memory beyond each row
             self._student_encodings = {
-                Path(name).stem: enc.astype(np.float32)
+                # Use the stem part before any ::aug: suffix for dict key (student name)
+                Path(name.split("::aug:", 1)[0]).stem: enc.astype(np.float32)
                 for name, enc in zip(cache["names"], cache["encodings"])
             }
             # rebuild norms for cosine tests
@@ -223,13 +255,20 @@ class PhotoSorter:
                 progress_callback(current, total, student_name)
 
             try:
-                image = face_recognition.load_image_file(str(ref_path))
+                # Use utility loader which respects MAX_IMAGE_DIMENSION and enhancement
+                img_arr = load_image_for_recognition(ref_path, max_dimension=self.MAX_IMAGE_DIMENSION, logger=self.logger, apply_enhancement=self._apply_enhancement)
+                if img_arr is None:
+                    if self.logger:
+                        self.logger.warning("No face detected in reference photo for %s (%s)", student_name, ref_path.name)
+                    no_face_names.append(student_name)
+                    continue
+
                 locations = face_recognition.face_locations(
-                    image, number_of_times_to_upsample=self._detection_upsample, model=self._detection_model
+                    img_arr, number_of_times_to_upsample=self._detection_upsample, model=self._detection_model
                 )
 
                 encodings = face_recognition.face_encodings(
-                    image,
+                    img_arr,
                     known_face_locations=locations if locations else None,
                     num_jitters=self._num_jitters_ref,
                     model=self._encoding_model,
@@ -263,8 +302,50 @@ class PhotoSorter:
                 if self.logger:
                     self.logger.info("Loaded reference for %s", student_name)
 
+                # Augment reference encodings (lightweight, few variants)
+                if self.AUGMENT_REF:
+                    try:
+                        # open with PIL for augmentations
+                        with Image.open(ref_path) as pil_img:
+                            pil_img = pil_img.convert("RGB")
+                            aug_i = 0
+                            for aug in self.AUGMENTATIONS:
+                                if aug == "flip":
+                                    img_aug = ImageOps.mirror(pil_img)
+                                elif aug == "bright_minus":
+                                    img_aug = ImageEnhance.Brightness(pil_img).enhance(0.9)
+                                elif aug == "bright_plus":
+                                    img_aug = ImageEnhance.Brightness(pil_img).enhance(1.1)
+                                else:
+                                    continue
+
+                                arr_aug = np.asarray(img_aug)
+                                try:
+                                    locs_aug = face_recognition.face_locations(arr_aug, number_of_times_to_upsample=self._detection_upsample, model=self._detection_model)
+                                    encs_aug = face_recognition.face_encodings(arr_aug, known_face_locations=locs_aug if locs_aug else None, num_jitters=max(1, self._num_jitters_ref//2), model=self._encoding_model)
+                                except Exception:
+                                    encs_aug = []
+
+                                if encs_aug:
+                                    aug_enc = np.asarray(encs_aug[0], dtype=np.float32)
+                                    # store with synthetic name referencing original file
+                                    aug_name = f"{ref_path.name}::aug:{aug_i}"
+                                    names.append(aug_name)
+                                    mtimes.append(int(ref_path.stat().st_mtime_ns))
+                                    enc_list.append(aug_enc)
+                                    aug_i += 1
+
+                                # free
+                                del arr_aug
+                                del img_aug
+                                gc.collect()
+
+                    except Exception:
+                        if self.logger:
+                            self.logger.debug("Augmentation failed for %s — continuing", ref_path.name)
+
                 # release large image memory ASAP
-                del image
+                del img_arr
                 del locations
                 del encodings
                 gc.collect()
@@ -479,15 +560,10 @@ class PhotoSorter:
         return counts
 
     def _load_and_resize(self, image_path: Path) -> np.ndarray:
-        with Image.open(image_path) as img:
-            img = img.convert("RGB")
-            width, height = img.size
-            longest = max(width, height)
-            if longest > self.MAX_IMAGE_DIMENSION:
-                scale = self.MAX_IMAGE_DIMENSION / longest
-                new_size = (int(width * scale), int(height * scale))
-                img = img.resize(new_size, Image.LANCZOS)
-            arr = np.asarray(img, dtype=np.uint8)
+        # Use the utils loader so enhancements and max_dimension are consistent
+        arr = load_image_for_recognition(image_path, max_dimension=self.MAX_IMAGE_DIMENSION, logger=self.logger, apply_enhancement=self._apply_enhancement)
+        if arr is None:
+            raise UnidentifiedImageError()
         return arr
 
     def _match_face_memory_efficient(self, encoding: np.ndarray) -> tuple[str | None, float | None, float | None, bool, bool]:
