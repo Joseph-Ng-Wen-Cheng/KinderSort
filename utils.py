@@ -8,6 +8,10 @@ This version improves preprocessing and adds feature extraction utilities:
 - L2 normalisation and similarity helpers.
 - Keeps APIs used by sorter.py: setup_logger, is_image_file, collect_event_images,
   build_output_filename, safe_copy, compute_file_hash, ensure_folder.
+
+Added optional automatic contrast/brightness preprocessing (lightweight, Pillow-only)
+so we avoid adding OpenCV dependency. This improves face detection on low-quality
+photos while remaining CPU-only.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 
-from PIL import ExifTags, Image, UnidentifiedImageError
+from PIL import ExifTags, Image, UnidentifiedImageError, ImageOps, ImageEnhance
 import numpy as np
 
 # Optional dependency: face_recognition (wrap imports)
@@ -191,11 +195,32 @@ def _apply_exif_orientation(img: Image.Image) -> Image.Image:
     return img
 
 
+def _apply_enhancement(img: Image.Image) -> Image.Image:
+    """Apply a lightweight, Pillow-only enhancement to improve contrast/brightness.
+
+    This intentionally avoids OpenCV to keep dependencies small. Effects are modest
+    but often sufficient to help face detectors on poor images.
+    """
+    try:
+        # Auto-contrast to stretch histogram
+        img = ImageOps.autocontrast(img, cutoff=1)
+        # Slight contrast boost
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.1)
+        # Slight brightness tweak (no-op for most images)
+        be = ImageEnhance.Brightness(img)
+        img = be.enhance(1.05)
+    except Exception:
+        pass
+    return img
+
+
 def load_image_for_recognition(path: Path, max_dimension: int = MAX_IMAGE_DIMENSION,
-                                logger: Optional[logging.Logger] = None) -> Optional[np.ndarray]:
+                                logger: Optional[logging.Logger] = None, apply_enhancement: bool = False) -> Optional[np.ndarray]:
     """Load an image, apply EXIF rotation, convert to RGB and optionally resize.
 
-    Returns an RGB numpy array (H, W, 3) or None on error.
+    If apply_enhancement is True, run a lightweight auto-contrast/brightness/contrast pass
+    to help detection on underexposed images. Returns an RGB numpy array (H, W, 3) or None on error.
     """
     img = open_image_safely(path, logger=logger)
     if img is None:
@@ -203,6 +228,8 @@ def load_image_for_recognition(path: Path, max_dimension: int = MAX_IMAGE_DIMENS
 
     try:
         img = _apply_exif_orientation(img)
+        if apply_enhancement:
+            img = _apply_enhancement(img)
         img = img.convert("RGB")
         w, h = img.size
         largest = max(w, h)
@@ -529,4 +556,3 @@ def safe_copy(src: Path, dest_folder: Path, filename: str, logger: logging.Logge
 
 
 # End of file
-
