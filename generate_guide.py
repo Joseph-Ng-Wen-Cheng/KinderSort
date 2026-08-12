@@ -310,14 +310,12 @@ def explain_sorting_result(
     return "\n\n".join(lines)
 
 
+# Fix for write_guidebook_md() in generate_guide.py
+
 def write_guidebook_md() -> None:
     """Write the teacher guidebook as guidebook.md with embedded screenshots."""
     print("\nWriting guidebook.md...")
 
-    # Create an example dynamic explanation using plausible numbers.
-    # When producing the final guide from within the sorter, replace these example
-    # values with the real metrics and call explain_sorting_result(...) to get
-    # a real-time summary for teachers.
     example_explanation = explain_sorting_result(
         total_images=120,
         matched=95,
@@ -326,6 +324,51 @@ def write_guidebook_md() -> None:
         per_student_counts={"Ali": 12, "Siti": 10, "Kumar": 9, "Zara": 8},
         low_confidence=7,
     )
+
+    content = f"""# KinderSort — Teacher's Guide
+
+*How to sort your students' event photos automatically*
+
+---
+
+## What KinderSort Does
+
+KinderSort looks at each photo from a school event and finds your students' faces.
+It then automatically puts each photo into the right student's folder — so you don't
+have to sort hundreds of photos by hand!
+
+**One photo can appear in multiple folders** — for example, a group shot with three
+students will be copied to all three students' folders.
+
+---
+
+## Before You Start
+
+You need three folders ready on your computer:
+
+### 1. Reference Photos Folder
+One clear, front-facing photo of each student.
+- Name each photo with the student's full name
+- Examples: `Ali.jpg`, `Siti.png`, `Kumar.jpeg`
+- Make sure the face is clearly visible and well-lit
+
+### 2. Events Folder
+A folder containing **subfolders** — one subfolder per event.
+- Example structure:
+  - `SportsDay/`
+  - `ScienceFair/`
+
+### 3. Output Folder
+An empty folder where KinderSort will place the sorted results.
+
+---
+
+## Sample Run Explanation
+
+{example_explanation}
+"""
+    Path("guidebook.md").write_text(content, encoding="utf-8")
+    print("Saved guidebook.md successfully.")
 
     content = f"""# KinderSort — Teacher's Guide
 
