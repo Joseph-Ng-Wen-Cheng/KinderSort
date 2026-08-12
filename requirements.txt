@@ -3,3 +3,4 @@ dlib==19.24.2
 Pillow==10.3.0
 numpy==1.26.4
 psutil==5.9.8
+requests==2.31.0
