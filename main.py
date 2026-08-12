@@ -303,47 +303,45 @@ class KinderSortApp(tk.Tk):
         """Check backend availability when selection changes."""
         self._check_backend_availability()
 
+    # Updated snippet in main.py
+
     def _check_backend_availability(self) -> None:
-        """Check and display backend availability status."""
-        try:
-            backend_mgr = BackendManager(
-                preferred_backend=self._backend_var.get(),
-                nvidia_api_key=self._nvidia_key_var.get(),
-                logger=self.logger or logging.getLogger("KinderSort"),
-            )
-            backends = backend_mgr.get_available_backends()
-            status_parts = [f"{k}: {'✓' if v else '✗'}" for k, v in backends.items()]
-            self._backend_status_label.config(
-                text=" | ".join(status_parts),
-                fg="#00aa00" if any(backends.values()) else "#cc0000"
-            )
-        except Exception as e:
-            self._backend_status_label.config(text=f"Check: {str(e)[:40]}", fg="#cc0000")
+        """Check backend availability asynchronously to prevent GUI freezing."""
+        def _check():
+            try:
+                backend_mgr = BackendManager(
+                    preferred_backend=self._backend_var.get(),
+                    nvidia_api_key=self._nvidia_key_var.get(),
+                    logger=self.logger or logging.getLogger("KinderSort"),
+                )
+                backends = backend_mgr.get_available_backends()
+                status_parts = [f"{k}: {'✓' if v else '✗'}" for k, v in backends.items()]
+                text = " | ".join(status_parts)
+                color = "#00aa00" if any(backends.values()) else "#cc0000"
+            except Exception as e:
+                text = f"Check: {str(e)[:40]}"
+                color = "#cc0000"
+
+            self.after(0, lambda: self._backend_status_label.config(text=text, fg=color))
+
+        threading.Thread(target=_check, daemon=True).start()
 
     def _on_start(self) -> None:
-        """Validate inputs then launch the worker thread."""
+        """Validate inputs then launch background worker thread."""
         ref = self._reference_var.get().strip()
         events = self._events_var.get().strip()
         output = self._output_var.get().strip()
 
         if not ref or not events or not output:
-            messagebox.showerror(
-                "Missing folders",
-                "Please select all three folders before starting.",
-            )
+            messagebox.showerror("Missing folders", "Please select all three folders before starting.")
             return
 
-        ref_path = Path(ref)
-        events_path = Path(events)
-        output_path = Path(output)
-
-        # Validate paths and contents
+        ref_path, events_path, output_path = Path(ref), Path(events), Path(output)
         ok, msg = self._validate_inputs(ref_path, events_path, output_path)
         if not ok:
             messagebox.showerror("Input validation failed", msg)
             return
 
-        # Disable start, enable cancel
         self._start_btn.config(state=tk.DISABLED)
         self._cancel_btn.config(state=tk.NORMAL)
         self._cancel_flag.clear()
@@ -352,23 +350,36 @@ class KinderSortApp(tk.Tk):
         self._set_status("🔄 Initializing AI backend and loading reference photos…")
         self._start_ticker()
 
-        # Prepare logger and sorter
         logger = setup_logger(output_path)
         self.logger = logger
-        mode = self._mode_var.get()
-        backend = self._backend_var.get()
-        nvidia_key = self._nvidia_key_var.get() if backend in ["nvidia", "auto"] else None
 
-        sorter = PhotoSorter(
-            ref_path,
-            events_path,
-            output_path,
-            logger,
-            mode=mode,
-            ai_backend=backend,
-            nvidia_api_key=nvidia_key,
+        # Move PhotoSorter construction to background thread
+        thread = threading.Thread(
+            target=self._run_sorting_background,
+            args=(ref_path, events_path, output_path, logger),
+            daemon=True
         )
+        thread.start()
 
+    def _run_sorting_background(self, ref_path: Path, events_path: Path, output_path: Path, logger: logging.Logger) -> None:
+        """Background worker thread: instantiate sorter, load references, and process photos."""
+        try:
+            mode = self._mode_var.get()
+            backend = self._backend_var.get()
+            nvidia_key = self._nvidia_key_var.get() if backend in ["nvidia", "auto"] else None
+
+            sorter = PhotoSorter(
+                ref_path,
+                events_path,
+                output_path,
+                logger,
+                mode=mode,
+                ai_backend=backend,
+                nvidia_api_key=nvidia_key,
+            )
+            self._run_sorting(sorter)
+        except Exception as exc:
+            self._msg_queue.put(("error", f"Initialization failed: {exc}"))
         # Start background worker thread
         thread = threading.Thread(
             target=self._run_sorting, args=(sorter,), daemon=True
