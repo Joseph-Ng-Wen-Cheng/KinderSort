@@ -1,0 +1,14 @@
+2026-08-12 21:52:28 - DEBUG - NVIDIA API unreachable: 404
+2026-08-12 21:52:32 - DEBUG - Ollama not reachable: HTTPConnectionPool(host='localhost', port=11434): Max retries exceeded with url: /api/tags (Caused by NewConnectionError("HTTPConnection(host='localhost', port=11434): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it"))
+2026-08-12 21:52:32 - INFO - Backend: Dlib (auto-fallback)
+2026-08-12 21:52:34 - INFO - Loaded reference face for student: john-cena (john-cena.jpg)
+2026-08-12 21:52:34 - INFO - Loaded reference face for student: lisa (lisa.webp)
+2026-08-12 21:52:34 - INFO - Generated single-page student roster report: C:\Users\User\Downloads\KinderSort-main\Output Folder\Student_Roster_Report.docx
+2026-08-12 21:52:36 - INFO - Loaded reference face for student: john-cena (john-cena.jpg)
+2026-08-12 21:52:36 - INFO - Loaded reference face for student: lisa (lisa.webp)
+2026-08-12 21:52:36 - INFO - Generated single-page student roster report: C:\Users\User\Downloads\KinderSort-main\Output Folder\Student_Roster_Report.docx
+2026-08-12 21:52:36 - INFO - Found 2 event photos to process
+2026-08-12 21:52:39 - INFO - Loaded reference face for student: john-cena (john-cena.jpg)
+2026-08-12 21:52:40 - INFO - Loaded reference face for student: lisa (lisa.webp)
+2026-08-12 21:52:40 - INFO - Generated single-page student roster report: C:\Users\User\Downloads\KinderSort-main\Output Folder\Student_Roster_Report.docx
+2026-08-12 21:52:40 - INFO - Found 2 event photos to process
