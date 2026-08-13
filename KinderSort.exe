@@ -1,0 +1,1 @@
+pyinstaller --onefile --windowed --name "KinderSort" main.py
